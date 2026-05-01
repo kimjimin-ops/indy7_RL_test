@@ -1,0 +1,184 @@
+import math
+import torch
+import isaaclab.sim as sim_utils
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+from isaaclab.envs import ManagerBasedRLEnvCfg, ManagerBasedRLEnv
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.utils import configclass
+from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
+import isaaclab.envs.mdp as mdp
+
+from test3.assets import INDY7_CFG
+
+
+##
+# Custom obs / reward functions
+##
+
+def ee_position_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """EE world position relative to robot base."""
+    asset = env.scene[asset_cfg.name]
+    return asset.data.body_state_w[:, asset_cfg.body_ids[0], :3] - asset.data.root_state_w[:, :3]
+
+
+def cube_position_w(env: ManagerBasedRLEnv, object_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Cube world position relative to robot base."""
+    robot = env.scene["robot"]
+    cube = env.scene[object_cfg.name]
+    return cube.data.root_state_w[:, :3] - robot.data.root_state_w[:, :3]
+
+
+def cube_lifted(env: ManagerBasedRLEnv, object_cfg: SceneEntityCfg, lift_threshold: float) -> torch.Tensor:
+    """Reward: cube lifted above threshold height."""
+    cube = env.scene[object_cfg.name]
+    cube_z = cube.data.root_state_w[:, 2]
+    return (cube_z > lift_threshold).float()
+
+
+def ee_to_cube_distance(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, object_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Reward: negative distance from EE to cube."""
+    asset = env.scene[asset_cfg.name]
+    cube = env.scene[object_cfg.name]
+    ee_pos = asset.data.body_state_w[:, asset_cfg.body_ids[0], :3]
+    
+    tcp_offset = torch.tensor([0.0, 0.0, 0.15], device=ee_pos.device).unsqueeze(0)
+    tcp_pos = ee_pos + tcp_offset  
+    
+    cube_pos = cube.data.root_state_w[:, :3]
+    distance = torch.norm(tcp_pos - cube_pos, dim=1)
+    return 1.0 - torch.tanh(distance / 0.1)
+
+
+##
+# Scene
+##
+
+@configclass
+class ReachSceneCfg(InteractiveSceneCfg):
+    ground = AssetBaseCfg(
+        prim_path="/World/ground",
+        spawn=sim_utils.GroundPlaneCfg(),
+    )
+    robot: ArticulationCfg = INDY7_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    cube = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Cube",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.08, 0.08, 0.08),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.1),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.5, 0.0, 0.025)),
+    )
+    light = AssetBaseCfg(
+        prim_path="/World/light",
+        spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=2500.0),
+    )
+
+
+@configclass
+class ActionsCfg:
+    arm_action = JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=["joint[0-5]"],
+        scale=0.5,
+        use_default_offset=True,
+    )
+    gripper_action = JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=["PrismaticJoint", "PrismaticJoint_finger1_b"],
+        scale=1.0,
+        use_default_offset=False,
+    )
+
+
+@configclass
+class ObservationsCfg:
+    @configclass
+    class PolicyCfg(ObsGroup):
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        ee_pos = ObsTerm(
+            func=ee_position_w,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=["fingerhalf_01"])},
+        )
+        cube_pos = ObsTerm(
+            func=cube_position_w,
+            params={"object_cfg": SceneEntityCfg("cube")},
+        )
+        gripper_pos = ObsTerm(
+            func=mdp.joint_pos_rel,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=["PrismaticJoint", "PrismaticJoint_finger1_b"])},
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
+class RewardsCfg:
+    ee_to_cube = RewTerm(
+        func=ee_to_cube_distance,
+        weight=1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["fingerhalf_01"]),
+            "object_cfg": SceneEntityCfg("cube"),
+        },
+    )
+    joint_vel_penalty = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-0.001,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.001)
+    cube_lift = RewTerm(
+        func=cube_lifted,
+        weight=5.0,
+        params={"object_cfg": SceneEntityCfg("cube"), "lift_threshold": 0.05},
+    )
+
+
+@configclass
+class EventCfg:
+    reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
+    reset_cube_position = EventTerm(
+        func=mdp.reset_root_state_uniform,
+        mode="reset",
+        params={
+            "pose_range": {"x": (0.1, 0.2), "y": (0.1, 0.2), "z": (0.025, 0.025)},
+            "velocity_range": {},
+            "asset_cfg": SceneEntityCfg("cube"),
+        },
+    )
+
+
+@configclass
+class TerminationsCfg:
+    time_out = DoneTerm(func=mdp.time_out, time_out=True)
+
+
+@configclass
+class Indy7ReachEnvCfg(ManagerBasedRLEnvCfg):
+    scene: ReachSceneCfg = ReachSceneCfg(num_envs=4096, env_spacing=3.0)
+    actions: ActionsCfg = ActionsCfg()
+    observations: ObservationsCfg = ObservationsCfg()
+    rewards: RewardsCfg = RewardsCfg()
+    events: EventCfg = EventCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
+
+    def __post_init__(self):
+        self.decimation = 4
+        self.episode_length_s = 8.0
+        self.sim.dt = 1.0 / 120.0
+        self.sim.render_interval = self.decimation
+        self.viewer.eye = (2.5, 2.5, 2.5)
