@@ -1,0 +1,116 @@
+# /home/kimjimin/Desktop/train_bc.py
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import h5py
+import os
+
+##############################################################
+# 1. 데이터셋
+##############################################################
+class DemoDataset(Dataset):
+    def __init__(self, hdf5_path):
+        self.obs     = []
+        self.actions = []
+
+        with h5py.File(hdf5_path, "r") as f:
+            total = f["data"].attrs["total_demos"]
+            for i in range(total):
+                ep = f[f"data/demo_{i}"]
+                self.obs.append(ep["obs"][:])        # [T, 8]
+                self.actions.append(ep["actions"][:]) # [T, 8]
+
+        self.obs     = torch.FloatTensor(np.concatenate(self.obs,     axis=0))
+        self.actions = torch.FloatTensor(np.concatenate(self.actions, axis=0))
+        print(f"[Dataset] 총 {len(self.obs)} 스텝 로드")
+
+    def __len__(self):
+        return len(self.obs)
+
+    def __getitem__(self, idx):
+        return self.obs[idx], self.actions[idx]
+
+
+##############################################################
+# 2. 정책 신경망 (MLP)
+##############################################################
+class BCPolicy(nn.Module):
+    def __init__(self, obs_dim=8, action_dim=8, hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.ELU(),
+            nn.Linear(hidden, hidden),
+            nn.ELU(),
+            nn.Linear(hidden, hidden),
+            nn.ELU(),
+            nn.Linear(hidden, action_dim),
+        )
+
+    def forward(self, obs):
+        return self.net(obs)
+
+
+##############################################################
+# 3. BC 학습
+##############################################################
+def train_bc(
+    hdf5_path  = "/home/kimjimin/Desktop/indy7_demos.hdf5",
+    save_path  = "/home/kimjimin/Desktop/bc_policy.pth",
+    epochs     = 300,
+    batch_size = 256,
+    lr         = 1e-3,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Device] {device}")
+
+    dataset    = DemoDataset(hdf5_path)
+    dataloader = DataLoader(dataset, batch_size=batch_size,
+                            shuffle=True, drop_last=True)
+
+    policy    = BCPolicy(obs_dim=8, action_dim=8).to(device)
+    optimizer = optim.Adam(policy.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    best_loss = float("inf")
+
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for obs_batch, act_batch in dataloader:
+            obs_batch = obs_batch.to(device)
+            act_batch = act_batch.to(device)
+
+            pred = policy(obs_batch)
+            loss = criterion(pred, act_batch)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(dataloader)
+
+        if (epoch + 1) % 50 == 0:
+            print(f"[Epoch {epoch+1}/{epochs}] Loss: {avg_loss:.6f}")
+
+        # 가장 좋은 모델 저장
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save({
+                "epoch":        epoch,
+                "model_state":  policy.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "loss":         best_loss,
+                "obs_dim":      8,
+                "action_dim":   8,
+            }, save_path)
+
+    print(f"\n[완료] BC 정책 저장: {save_path}")
+    print(f"[최종 Loss] {best_loss:.6f}")
+
+
+if __name__ == "__main__":
+    train_bc()
