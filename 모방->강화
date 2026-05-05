@@ -1,0 +1,121 @@
+"""
+Phase 2: BC → RL 파인튜닝
+실행: /home/kimjimin/IsaacLab/isaaclab.sh -p /home/kimjimin/Desktop/train_rl_from_bc.py
+"""
+
+import argparse
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser()
+AppLauncher.add_app_launcher_args(parser)
+args, _ = parser.parse_known_args()
+args.headless = False   # 학습 시 headless 권장
+app_launcher = AppLauncher(args)
+simulation_app = app_launcher.app
+
+import sys, torch, torch.nn as nn
+sys.path.append("/home/kimjimin/test3/source/test3/test3/tasks/reach")
+
+from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
+from rsl_rl.runners import OnPolicyRunner
+from env_cfg import Indy7ReachEnvCfg
+
+##############################################################
+# 환경 생성
+##############################################################
+env_cfg = Indy7ReachEnvCfg()
+env_cfg.scene.num_envs = 512   # 메모리에 따라 조절
+env = ManagerBasedRLEnv(cfg=env_cfg)
+
+obs_dim    = env.observation_manager.group_obs_dim["policy"][0]
+action_dim = env.action_manager.total_action_dim
+print(f"[ENV] obs_dim={obs_dim}, action_dim={action_dim}")
+
+##############################################################
+# RSL-RL 설정
+##############################################################
+runner_cfg = RslRlOnPolicyRunnerCfg(
+    num_steps_per_env   = 24,
+    max_iterations      = 3000,
+    save_interval       = 200,
+    experiment_name     = "indy7_pick_place",
+    run_name            = "bc_rl",
+    resume              = False,
+    device              = "cuda:0",
+    algorithm           = RslRlPpoAlgorithmCfg(
+        value_loss_coef        = 1.0,
+        use_clipped_value_loss = True,
+        clip_param             = 0.2,
+        entropy_coef           = 0.005,
+        num_learning_epochs    = 5,
+        num_mini_batches       = 4,
+        learning_rate          = 1e-4,   # BC 이후라 낮게
+        schedule               = "adaptive",
+        gamma                  = 0.99,
+        lam                    = 0.95,
+        desired_kl             = 0.01,
+        max_grad_norm          = 1.0,
+    ),
+    policy = RslRlPpoActorCriticCfg(
+        init_noise_std     = 0.3,        # BC 이후라 낮게
+        actor_hidden_dims  = [256, 256, 256],
+        critic_hidden_dims = [256, 256, 256],
+        activation         = "elu",
+    ),
+)
+
+
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+env_wrapped = RslRlVecEnvWrapper(env)
+
+runner = OnPolicyRunner(
+    env_wrapped,
+    runner_cfg.to_dict(),       # ← .to_dict() 추가
+    log_dir="./logs/indy7_pick_place",
+    device="cuda:0"
+)
+
+##############################################################
+# BC 출력 레이어 → RL actor 이식
+# obs_dim 불일치로 입력 레이어는 건너뛰고
+# 출력 레이어(action 생성부)만 복사
+##############################################################
+def transfer_bc_to_rl(bc_path, runner):
+    ckpt     = torch.load(bc_path, map_location="cuda:0")
+    bc_state = ckpt["model_state"]
+
+    # ✅ 정확한 경로: runner.alg.policy.actor
+    rl_actor = runner.alg.policy.actor
+    rl_state = rl_actor.state_dict()
+
+    print("\n[BC→RL] 레이어 이식 시도:")
+    transferred = 0
+    for rl_key in rl_state:
+        for bc_key, bc_val in bc_state.items():
+            if rl_state[rl_key].shape == bc_val.shape:
+                if "6" in bc_key:   # BC 마지막 출력 레이어 (action 8개)
+                    rl_state[rl_key].copy_(bc_val)
+                    print(f"  ✅ {bc_key} → {rl_key}  {bc_val.shape}")
+                    transferred += 1
+                    break
+
+    rl_actor.load_state_dict(rl_state)
+    print(f"[BC→RL] {transferred}개 레이어 이식 완료\n")
+
+transfer_bc_to_rl("/home/kimjimin/Desktop/bc_policy.pth", runner)
+
+
+
+# 임시 디버그 — runner.alg의 속성 확인
+print("[DEBUG] PPO attributes:", [a for a in dir(runner.alg) if not a.startswith('_')])
+print("[DEBUG] runner attributes:", [a for a in dir(runner) if not a.startswith('_')])
+
+##############################################################
+# RL 학습 시작
+##############################################################
+print("[RL] 학습 시작...")
+runner.learn(num_learning_iterations=3000, init_at_random_ep_len=True)
+
+env.close()
+simulation_app.close()
