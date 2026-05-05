@@ -1,0 +1,256 @@
+"""
+Isaac Sim Standalone Teleop — 직접 조인트 제어 방식
+실행: /home/kimjimin/IsaacLab/isaaclab.sh -p /home/kimjimin/Desktop/teleop_collect.py
+"""
+
+import argparse
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser()
+AppLauncher.add_app_launcher_args(parser)
+args, _ = parser.parse_known_args()
+args.headless = False
+app_launcher = AppLauncher(args)
+simulation_app = app_launcher.app
+
+import torch
+import numpy as np
+import h5py
+import os
+from pynput import keyboard as kb
+
+import isaaclab.sim as sim_utils
+from isaaclab.sim import SimulationContext
+from isaaclab.assets import Articulation, ArticulationCfg
+from isaaclab.actuators import ImplicitActuatorCfg
+
+##############################################################
+# 상수
+##############################################################
+USD_PATH     = "/home/kimjimin/test3/source/test3/test3/assets/model/usd/indy7/indy7_simplified_260424.usda"
+SAVE_PATH    = "/home/kimjimin/Desktop/joint0_demos.hdf5"
+GRIPPER_OPEN   = 0.015
+GRIPPER_CLOSED = 0.0
+JOINT_STEP     = 0.02   # 조인트 이동 단위 (rad)
+
+##############################################################
+# 키보드 상태
+##############################################################
+selected_joint = 0        # 현재 선택된 조인트 (0~5)
+joint_direction = 0       # +1, -1, 0
+gripper_state  = GRIPPER_OPEN
+save_episode   = False
+quit_flag      = False
+
+pressed_keys = set()
+
+def on_press(key):
+    global selected_joint, joint_direction
+    global gripper_state, save_episode, quit_flag
+
+    try:
+        ch = key.char
+        if ch is None:      # ← 이 줄 추가
+            return
+
+        pressed_keys.add(ch)
+
+        if ch in '123456':
+            selected_joint = int(ch) - 1
+            print(f"[선택] Joint {selected_joint} (joint{selected_joint})")
+
+        if ch == '+' or ch == '=':
+            joint_direction = 1
+        if ch == '-':
+            joint_direction = -1
+
+        if ch == 'g':
+            gripper_state = GRIPPER_CLOSED if gripper_state == GRIPPER_OPEN \
+                            else GRIPPER_OPEN
+            label = "CLOSED (grasp)" if gripper_state == GRIPPER_CLOSED else "OPEN"
+            print(f"[Gripper] {label}")
+
+        if ch == 'r':
+            save_episode = True
+
+    except AttributeError:
+        if key == kb.Key.esc:
+            quit_flag = True
+def on_release(key):
+    global joint_direction
+    try:
+        ch = key.char
+        pressed_keys.discard(ch)
+        if ch in ('+', '=', '-'):
+            joint_direction = 0
+    except AttributeError:
+        pass
+
+listener = kb.Listener(on_press=on_press, on_release=on_release)
+listener.start()
+
+##############################################################
+# SimulationContext
+##############################################################
+sim_cfg = sim_utils.SimulationCfg(
+    dt=1.0 / 60.0,
+    device="cpu",
+)
+sim = SimulationContext(sim_cfg)
+sim.set_camera_view(eye=[1.5, 1.5, 1.5], target=[0.5, 0.0, 0.5])
+
+##############################################################
+# 씬 구성
+##############################################################
+sim_utils.GroundPlaneCfg().func("/World/ground", sim_utils.GroundPlaneCfg())
+sim_utils.DomeLightCfg(intensity=2500.0).func(
+    "/World/light", sim_utils.DomeLightCfg(intensity=2500.0))
+
+cube_cfg = sim_utils.CuboidCfg(
+    size=(0.07, 0.07, 0.07),
+    rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+    mass_props=sim_utils.MassPropertiesCfg(mass=0.1),
+    collision_props=sim_utils.CollisionPropertiesCfg(),
+    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+)
+cube_cfg.func("/World/Cube", cube_cfg, translation=(0.5, 0.0, 0.025))
+
+robot_cfg = ArticulationCfg(
+    prim_path="/World/indy7",
+    spawn=sim_utils.UsdFileCfg(
+        usd_path=USD_PATH,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+            max_depenetration_velocity=5.0,
+        ),
+    ),
+    init_state=ArticulationCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.0),
+        joint_pos={
+            "joint0": 0.0,
+            "joint1": 0.0,
+            "joint2": 0.0,
+            "joint3": 0.0,
+            "joint4": 0.0,
+            "joint5": 0.0,
+            "PrismaticJoint":           GRIPPER_OPEN,
+            "PrismaticJoint_finger1_b": GRIPPER_OPEN,
+        },
+    ),
+    actuators={
+        "arm": ImplicitActuatorCfg(
+            joint_names_expr=["joint[0-5]"],
+            stiffness=400.0,
+            damping=40.0,
+        ),
+        "gripper": ImplicitActuatorCfg(
+            joint_names_expr=["PrismaticJoint", "PrismaticJoint_finger1_b"],
+            stiffness=10000.0,
+            damping=100.0,
+        ),
+    },
+)
+robot = Articulation(cfg=robot_cfg)
+
+##############################################################
+# 초기화
+##############################################################
+sim.reset()
+
+joint_names   = robot.data.joint_names
+gripper_ids   = [joint_names.index("PrismaticJoint"),
+                 joint_names.index("PrismaticJoint_finger1_b")]
+arm_ids       = [joint_names.index(f"joint{i}") for i in range(6)]
+
+joint_target  = robot.data.joint_pos.clone()   # [1, 8]
+
+# 조인트 한계 (rad)
+JOINT_LIMIT = np.deg2rad(175.0)
+
+##############################################################
+# 데이터 버퍼
+##############################################################
+all_episodes  = []
+current_ep    = {"obs": [], "actions": []}
+episode_count = 0
+TARGET_DEMOS  = 20
+
+print("\n=== 조작 방법 ===")
+print("  1~6    : 조인트 선택 (joint0~5)")
+print("  +      : 선택 조인트 + 방향")
+print("  -      : 선택 조인트 - 방향")
+print("  G      : 그리퍼 토글 (열림 ↔ 닫힘)")
+print("  R      : 에피소드 저장 + 리셋")
+print("  ESC    : 종료")
+print(f"\n현재 선택: Joint 0\n")
+
+##############################################################
+# 메인 루프
+##############################################################
+while simulation_app.is_running() and not quit_flag:
+
+    # ── 1. 선택 조인트 이동 ──────────────────────────────
+    if joint_direction != 0:
+        idx = arm_ids[selected_joint]
+        joint_target[0, idx] += joint_direction * JOINT_STEP
+        # 한계 클리핑
+        joint_target[0, idx] = torch.clamp(
+            joint_target[0, idx],
+            min=-JOINT_LIMIT, max=JOINT_LIMIT
+        )
+
+    # ── 2. 그리퍼 ─────────────────────────────────────
+    joint_target[0, gripper_ids[0]] = gripper_state
+    joint_target[0, gripper_ids[1]] = gripper_state
+
+    # ── 3. 명령 적용 ──────────────────────────────────
+    robot.set_joint_position_target(joint_target)
+    robot.write_data_to_sim()
+
+    # ── 4. 시뮬레이션 스텝 ───────────────────────────
+    sim.step()
+    robot.update(sim.cfg.dt)
+
+    # ── 5. 데이터 수집 ────────────────────────────────
+    obs_vec    = robot.data.joint_pos[0].cpu().numpy().copy()
+    action_vec = joint_target[0].cpu().numpy().copy()
+    current_ep["obs"].append(obs_vec)
+    current_ep["actions"].append(action_vec)
+
+    # ── 6. R키: 저장 + 리셋 ──────────────────────────
+    if save_episode:
+        save_episode = False
+        if len(current_ep["obs"]) > 10:
+            target_all = robot.data.joint_pos[0].cpu().numpy().copy()  # [8]
+            current_ep["target_joints"] = target_all
+            print(f"[목표 joints] {np.round(np.degrees(target_all), 1)}")
+
+            all_episodes.append(current_ep)
+            episode_count += 1
+            print(f"[저장] Episode {episode_count}/{TARGET_DEMOS} "
+                  f"({len(current_ep['obs'])} steps)")
+        current_ep = {"obs": [], "actions": [], "target_joints": None} # ✅ 초기화에 추가    
+
+    if episode_count >= TARGET_DEMOS:
+        print("[완료] 목표 에피소드 수 달성")
+        break
+    
+
+##############################################################
+# HDF5 저장
+##############################################################
+os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
+
+with h5py.File(SAVE_PATH, "w") as f:
+    grp = f.create_group("data")
+    for i, ep in enumerate(all_episodes):
+        ep_grp = grp.create_group(f"demo_{i}")
+        ep_grp.create_dataset("obs",
+            data=np.array(ep["obs"], dtype=np.float32))
+        ep_grp.create_dataset("actions",
+            data=np.array(ep["actions"], dtype=np.float32))
+        # ✅ 추가
+        ep_grp.create_dataset("target_joints",
+            data=np.array(ep["target_joints"], dtype=np.float32)) 
+        ep_grp.attrs["num_samples"] = len(ep["obs"])
+    grp.attrs["total_demos"] = len(all_episodes)
