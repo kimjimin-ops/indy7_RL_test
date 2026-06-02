@@ -1,0 +1,341 @@
+import math
+import torch
+import isaaclab.sim as sim_utils
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+from isaaclab.envs import ManagerBasedRLEnvCfg, ManagerBasedRLEnv
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.utils import configclass
+from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
+import isaaclab.envs.mdp as mdp
+
+from test3.assets import INDY7_CFG
+
+def ee_position_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    from isaaclab.utils.math import quat_apply
+    asset = env.scene[asset_cfg.name]
+    ee_pos  = asset.data.body_state_w[:, asset_cfg.body_ids[0], :3]
+    ee_quat = asset.data.body_state_w[:, asset_cfg.body_ids[0], 3:7]
+    local_offset = torch.tensor([[0.0, 0.0, 0.27]], device=ee_pos.device).expand(ee_pos.shape[0], -1)
+    world_offset = quat_apply(ee_quat, local_offset)
+    tcp_pos = ee_pos + world_offset
+    return tcp_pos - asset.data.root_state_w[:, :3]
+
+def cube_position_w(env: ManagerBasedRLEnv, object_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Cube world position relative to robot base."""
+    robot = env.scene["robot"]
+    cube = env.scene[object_cfg.name]
+    return cube.data.root_state_w[:, :3] - robot.data.root_state_w[:, :3]
+
+def conditional_cube_lifted(
+    env: ManagerBasedRLEnv, 
+    asset_cfg: SceneEntityCfg, 
+    object_cfg: SceneEntityCfg, 
+    distance_threshold: float,
+    z_init: float) -> torch.Tensor:
+    from isaaclab.utils.math import quat_apply
+    """Reward: EE가 큐브에 가까울 때, 큐브를 1cm~10cm 들어올리면 1.0~10.0의 보상 부여"""
+    asset = env.scene[asset_cfg.name]
+    cube = env.scene[object_cfg.name]
+    
+    # 1. EE TCP 위치 계산
+    ee_pos = asset.data.body_state_w[:, asset_cfg.body_ids[0], :3]
+    ee_quat = asset.data.body_state_w[:, asset_cfg.body_ids[0], 3:7]
+    local_offset = torch.tensor([[0.0, 0.0, 0.27]], device=ee_pos.device).expand(ee_pos.shape[0], -1)
+    world_offset = quat_apply(ee_quat, local_offset)
+    tcp_pos = ee_pos + world_offset
+    
+    # 2. 큐브 위치 및 EE-큐브 거리 조건 마스크
+    cube_pos = cube.data.root_state_w[:, :3]
+    distance = torch.norm(tcp_pos - cube_pos, dim=1)
+    is_close = distance < distance_threshold
+    
+    # 3. 들린 높이 계산 및 조건 마스크 (1cm 이상)
+    lift_height = cube_pos[:, 2] - z_init
+    is_lifted = lift_height >= 0.01
+    
+    # 4. 높이 기반 보상 스케일링 (1cm -> 1.0, 10cm -> 10.0)
+    # 10cm 이상 들어올려도 최대 보상 10.0으로 고정하려면 torch.clamp 사용
+    lift_reward = torch.clamp(lift_height * 100.0, min=0.0, max=10.0)
+    
+    # 5. 조건부 최종 보상 반환 (거리 조건 & 들림 조건 동시 만족 시)
+    return is_close.float() * is_lifted.float() * lift_reward
+
+def ee_to_cube_distance(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, object_cfg: SceneEntityCfg) -> torch.Tensor:
+    from isaaclab.utils.math import quat_apply
+    asset = env.scene[asset_cfg.name]
+    cube  = env.scene[object_cfg.name]
+    ee_pos  = asset.data.body_state_w[:, asset_cfg.body_ids[0], :3]
+    ee_quat = asset.data.body_state_w[:, asset_cfg.body_ids[0], 3:7]
+    local_offset = torch.tensor([[0.0, 0.0, 0.27]], device=ee_pos.device).expand(ee_pos.shape[0], -1)
+    world_offset = quat_apply(ee_quat, local_offset)
+    tcp_pos = ee_pos + world_offset
+    cube_pos = cube.data.root_state_w[:, :3]
+    distance = torch.norm(tcp_pos - cube_pos, dim=1)
+    return 1.0 - torch.tanh(distance / 0.5)
+
+def contact_penalty(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """로봇 링크가 지면과 접촉하면 패널티"""
+    asset = env.scene[asset_cfg.name]
+    body_pos_z = asset.data.body_state_w[:, asset_cfg.body_ids, 2]
+    contact = (body_pos_z < 0.1).any(dim=1).float()
+    return contact
+
+def gripper_auto_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg,
+    close_dist: float = 0.02,) -> torch.Tensor:
+    """큐브 근처(2cm 이하)에서 닫힘, 멀면 열림 유도"""
+    asset = env.scene[asset_cfg.name]
+    cube  = env.scene[object_cfg.name]
+
+    # EE와 큐브 거리
+    ee_pos   = asset.data.body_state_w[:, asset_cfg.body_ids[0], :3]
+    cube_pos = cube.data.root_state_w[:, :3]
+    dist     = torch.norm(ee_pos - cube_pos, dim=1)  # [num_envs]
+
+    # 그리퍼 현재 상태 (PrismaticJoint 2개 평균)
+    grip_pos = asset.data.joint_pos[:, -2:]  # 마지막 2개 = 그리퍼
+    grip_avg = grip_pos.mean(dim=1)          # [num_envs]
+
+    # 가까울 때(≤2cm): 닫힘(0.0)에 가까울수록 보상
+    # 멀 때(>2cm):     열림(0.015)에 가까울수록 보상
+    near = (dist <= close_dist)
+    target_grip = torch.where(near,
+        torch.zeros_like(grip_avg),             # 닫힘 목표
+        torch.full_like(grip_avg, 0.015),       # 열림 목표
+    )
+    
+    grip_error = torch.abs(grip_avg - target_grip)
+    return 1.0 - torch.tanh(grip_error / 0.005)
+
+def ee_cube_axis_alignment(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg,) -> torch.Tensor:
+    """link6의 x,y축이 큐브의 x,y축과 일치할수록 보상"""
+    from isaaclab.utils.math import quat_apply
+
+    asset = env.scene[asset_cfg.name]
+    cube  = env.scene[object_cfg.name]
+
+    # link6와 큐브의 quaternion
+    ee_quat   = asset.data.body_state_w[:, asset_cfg.body_ids[0], 3:7]
+    cube_quat = cube.data.root_state_w[:, 3:7]
+
+    # 각 좌표계의 x, y 단위벡터 추출
+    x_unit = torch.tensor([[1.0, 0.0, 0.0]], device=env.device).expand(env.num_envs, -1)
+    y_unit = torch.tensor([[0.0, 1.0, 0.0]], device=env.device).expand(env.num_envs, -1)
+
+    ee_x   = quat_apply(ee_quat,   x_unit)  # link6 x축 방향
+    ee_y   = quat_apply(ee_quat,   y_unit)  # link6 y축 방향
+    cube_x = quat_apply(cube_quat, x_unit)  # 큐브 x축 방향
+    cube_y = quat_apply(cube_quat, y_unit)  # 큐브 y축 방향
+
+    # 내적: 두 벡터가 같은 방향이면 1.0, 반대면 -1.0
+    align_x = torch.sum(ee_x * cube_x, dim=1)  # [num_envs]
+    align_y = torch.sum(ee_y * cube_y, dim=1)  # [num_envs]
+
+    # 절댓값: 180도 반대여도 같은 축 방향으로 허용
+    reward = (torch.abs(align_x) + torch.abs(align_y)) / 2.0
+    return reward
+
+def reset_cube_position_donut(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    min_radius: float,
+    max_radius: float,
+    z_height: float,):
+    """로봇의 베이스를 기준으로 도넛 형태(Annulus) 영역에 큐브를 랜덤 배치합니다."""
+    import math
+    cube_asset = env.scene[asset_cfg.name]
+    
+    # 1. 환경 내 로봇 에셋 접근
+    robot_asset = env.scene["robot"] 
+    num_resets = len(env_ids)
+    
+    # 2. 로컬 도넛 영역 오프셋 (x, y) 계산
+    u = torch.rand(num_resets, device=env.device)
+    r = torch.sqrt(u * (max_radius**2 - min_radius**2) + min_radius**2)
+    theta = torch.rand(num_resets, device=env.device) * 2 * math.pi
+    
+    local_x = r * torch.cos(theta)
+    local_y = r * torch.sin(theta)
+    
+    # 3. 로봇의 현재 월드 좌표 가져오기
+    # [num_resets, 3] 형태의 텐서에서 x, y 위치 추출
+    robot_pos_w = robot_asset.data.root_state_w[env_ids, :3]
+    env_origins = env.scene.env_origins[env_ids]
+    
+    # 4. 큐브의 상태 업데이트 (로봇 위치 + 도넛 오프셋)
+    root_states = cube_asset.data.default_root_state[env_ids].clone()
+    root_states[:, 0] = robot_pos_w[:, 0] + local_x
+    root_states[:, 1] = robot_pos_w[:, 1] + local_y
+    # Z축은 로봇 베이스가 아니라 지면(환경 원점)을 기준으로 일정한 높이 유지
+    root_states[:, 2] = env_origins[:, 2] + z_height 
+    
+    # 5. 변경된 상태를 시뮬레이터에 적용
+    cube_asset.write_root_pose_to_sim(root_states[:, :7], env_ids)
+    cube_asset.write_root_velocity_to_sim(root_states[:, 7:], env_ids)
+
+##
+# Scene
+##
+
+@configclass
+class ReachSceneCfg(InteractiveSceneCfg):
+    ground = AssetBaseCfg(
+        prim_path="/World/ground",
+        spawn=sim_utils.GroundPlaneCfg(),
+    )
+    robot: ArticulationCfg = INDY7_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    cube = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Cube",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.07, 0.07, 0.07),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.1),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.5, 0.0, 0.035)),
+    )
+    light = AssetBaseCfg(
+        prim_path="/World/light",
+        spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=2500.0),
+    )
+
+@configclass
+class ActionsCfg:
+    arm_action = JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=["joint[0-5]"],
+        scale=0.5,
+        use_default_offset=True,
+    )
+    gripper_action = JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=["PrismaticJoint", "PrismaticJoint_finger1_b"],
+        scale=1.0,
+        use_default_offset=False,
+    )
+
+@configclass
+class ObservationsCfg:
+    @configclass
+    class PolicyCfg(ObsGroup):
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        ee_pos = ObsTerm(
+            func=ee_position_w,
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=["link6"])},
+        )
+        cube_pos = ObsTerm(
+            func=cube_position_w,
+            params={"object_cfg": SceneEntityCfg("cube")},
+        )
+        gripper_pos = ObsTerm(
+            func=mdp.joint_pos_rel,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=["PrismaticJoint", "PrismaticJoint_finger1_b"])},
+        )
+
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    policy: PolicyCfg = PolicyCfg()
+
+@configclass
+class RewardsCfg:
+    ee_to_cube = RewTerm(
+        func=ee_to_cube_distance,
+        weight=1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["link6"]),
+            "object_cfg": SceneEntityCfg("cube"),
+        },
+    )
+    joint_vel_penalty = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-0.001,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    cube_lift = RewTerm(
+    func=conditional_cube_lifted,
+    weight=1.0,  # 내부에서 1.0~10.0으로 스케일링되므로 weight는 1.0
+    params={
+        "asset_cfg": SceneEntityCfg("robot", body_names=["link6"]), # 실제 로봇의 EE 링크 이름으로 매칭 필요
+        "object_cfg": SceneEntityCfg("cube"),
+        "distance_threshold": 0.1,  # EE와 큐브가 10cm 이내일 때만 보상 활성화
+        "z_init": 0.025,            # 큐브의 초기 Z축 높이 (환경에 맞게 수정)
+    },
+    )
+    ground_contact = RewTerm(
+        func=contact_penalty,
+        weight=-10.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["link6", "fingerhalf_01", "fingerhalf_02"]
+            ),
+        },
+    )
+    gripper_control = RewTerm(
+        func=gripper_auto_reward,
+        weight=0.0,              # ← Phase 1: 비활성화
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["fingerhalf_01"]),
+            "object_cfg": SceneEntityCfg("cube"),
+            "close_dist": 0.15,
+        },
+    )
+    axis_align = RewTerm(
+        func=ee_cube_axis_alignment,
+        weight=0.5,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["link6"]),
+            "object_cfg": SceneEntityCfg("cube"),
+        },
+    )
+
+@configclass
+class EventCfg:
+    reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
+    reset_cube_position = EventTerm(
+        func=reset_cube_position_donut, # 새로 만든 커스텀 함수 연결
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("cube"),
+            "min_radius": 0.5,  # 로봇 닿을 수 없는 영역(0.1865m) + 여유 마진
+            "max_radius": 0.70,  # 로봇 최대 가반 영역(0.8m) - 특이점 방지 마진
+            "z_height": 0.035,   # 큐브의 Z축 높이
+        },
+    )
+
+@configclass
+class TerminationsCfg:
+    time_out = DoneTerm(func=mdp.time_out, time_out=True)
+
+@configclass
+class Indy7ReachEnvCfg(ManagerBasedRLEnvCfg):
+    scene: ReachSceneCfg = ReachSceneCfg(num_envs=4096, env_spacing=3.0)
+    actions: ActionsCfg = ActionsCfg()
+    observations: ObservationsCfg = ObservationsCfg()
+    rewards: RewardsCfg = RewardsCfg()
+    events: EventCfg = EventCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
+
+    def __post_init__(self):
+        self.decimation = 4
+        self.episode_length_s = 8.0
+        self.sim.dt = 1.0 / 120.0
+        self.sim.render_interval = self.decimation
+        self.viewer.eye = (2.5, 2.5, 2.5)
