@@ -1,0 +1,107 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+import onnxruntime as ort
+import numpy as np
+import math
+
+# default joint positions (INDY7_CFG 기준)
+DEFAULT_JOINT_POS = np.array([0.0, 0.0, -1.5708, 0.0, -1.5708, 0.0], dtype=np.float32)
+SCALE = 0.2
+
+ARM_JOINT_NAMES = ['joint0', 'joint1', 'joint2', 'joint3', 'joint4', 'joint5']
+
+# 시뮬로 명령 보내는 토픽 (USDA subscribe 노드와 일치)
+SIM_COMMAND_TOPIC = '/sim_joint_command'
+# 시뮬에서 관절 상태 읽는 토픽 (USDA publish 노드가 내보내는 것)
+SIM_STATE_TOPIC = '/sim_joint_states'
+
+
+class RLPolicyNodeSim(Node):
+    def __init__(self):
+        super().__init__('rl_policy_node_sim')
+
+        self.policy = ort.InferenceSession(
+            '/home/kimjimin/IsaacLab/logs/rsl_rl/indy7_reach/'
+            '2026-06-16_14-00-19/exported/policy.onnx'
+        )
+
+        self.latest_joint_state = None
+
+        # obs는 시뮬 로봇 상태에서 읽음 (닫힌 루프)
+        self.sub = self.create_subscription(
+            JointState, SIM_STATE_TOPIC, self.joint_state_callback, 10)
+
+        # 시뮬로 명령 퍼블리시
+        self.sim_pub = self.create_publisher(
+            JointState, SIM_COMMAND_TOPIC, 10)
+
+        self.target = self.sample_target()
+        self.get_logger().info(
+            f'목표 pose: x={self.target[0]:.2f}, '
+            f'y={self.target[1]:.2f}, z={self.target[2]:.2f}'
+        )
+
+        self.timer = self.create_timer(1.0, self.control_loop)
+        self.get_logger().info(f'시작 — 시뮬 명령: {SIM_COMMAND_TOPIC}, 상태: {SIM_STATE_TOPIC}')
+
+    def sample_target(self):
+        x   = np.random.uniform(0.3, 0.6)
+        y   = np.random.uniform(-0.3, 0.3)
+        z   = np.random.uniform(0.3, 0.6)
+        yaw = np.random.uniform(-math.pi, math.pi)
+        qw  = math.cos(math.pi/2) * math.cos(yaw/2)
+        qx  = math.sin(math.pi/2) * math.cos(yaw/2)
+        qy  = math.sin(math.pi/2) * math.sin(yaw/2)
+        qz  = math.cos(math.pi/2) * math.sin(yaw/2)
+        return np.array([x, y, z, qw, qx, qy, qz], dtype=np.float32)
+
+    def joint_state_callback(self, msg):
+        self.latest_joint_state = msg
+
+    def get_ordered_pos_vel(self, msg):
+        """ARM_JOINT_NAMES 순서로 정렬."""
+        name_to_idx = {n: i for i, n in enumerate(msg.name)}
+        pos = np.zeros(6, dtype=np.float32)
+        vel = np.zeros(6, dtype=np.float32)
+        for i, jn in enumerate(ARM_JOINT_NAMES):
+            if jn not in name_to_idx:
+                return None, None
+            idx = name_to_idx[jn]
+            pos[i] = msg.position[idx]
+            vel[i] = msg.velocity[idx] if msg.velocity else 0.0
+        return pos, vel
+
+    def control_loop(self):
+        if self.latest_joint_state is None:
+            return
+
+        pos, vel = self.get_ordered_pos_vel(self.latest_joint_state)
+        if pos is None:
+            return
+
+        obs = np.concatenate([pos, vel, self.target]).reshape(1, -1).astype(np.float32)
+        action = self.policy.run(None, {'obs': obs})[0][0]
+
+        joint_positions = DEFAULT_JOINT_POS + SCALE * action
+
+        self.get_logger().info(
+            f'joint_pos(deg): {[f"{math.degrees(p):+.1f}" for p in joint_positions]}'
+        )
+
+        # 시뮬로 퍼블리시
+        js = JointState()
+        js.header.stamp = self.get_clock().now().to_msg()
+        js.name = ARM_JOINT_NAMES
+        js.position = joint_positions.tolist()
+        self.sim_pub.publish(js)
+
+
+def main():
+    rclpy.init()
+    node = RLPolicyNodeSim()
+    rclpy.spin(node)
+
+
+if __name__ == '__main__':
+    main()
