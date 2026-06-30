@@ -1,0 +1,24 @@
+import gymnasium as gym
+from .env_cfg import Indy7ReachEnvCfg
+from .bricksim_smoke import Indy7LegoSmokeEnv   # ← 추가
+
+gym.register(
+    id="Indy7-Reach-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": Indy7ReachEnvCfg,
+        "rsl_rl_cfg_entry_point": "test3.tasks.reach.learning.rsl_rl_cfg:ReachPPORunnerCfg",
+    },
+)
+
+# ↓ 추가: 스모크(Phase 0) task
+gym.register(
+    id="Indy7-Lego-Smoke-v0",
+    entry_point="test3.tasks.reach.bricksim_smoke:Indy7LegoSmokeEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": Indy7ReachEnvCfg,   # 기존 cfg 재사용 (클래스 직접 전달)
+        "rsl_rl_cfg_entry_point": "test3.tasks.reach.learning.rsl_rl_cfg:ReachPPORunnerCfg",
+    },
+)
