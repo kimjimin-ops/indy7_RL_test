@@ -1,0 +1,50 @@
+import os
+from isaaclab.assets.articulation import ArticulationCfg
+from isaaclab.actuators import ImplicitActuatorCfg
+import isaaclab.sim as sim_utils
+
+INDY7_CFG = ArticulationCfg(
+    spawn=sim_utils.UsdFileCfg(
+        usd_path=f"{os.path.dirname(os.path.abspath(__file__))}/model/usd/indy7/indy7_simplified_260611.usda",
+        activate_contact_sensors=False,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+            max_depenetration_velocity=5.0,
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=False,
+            solver_position_iteration_count=16,
+            solver_velocity_iteration_count=1,
+        ),
+    ),
+    init_state=ArticulationCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.89),
+        joint_pos={
+            "joint0": 0.0,
+            "joint1": 0.0,
+            "joint2": -1.5708,
+            "joint3": 0.0,
+            "joint4": -1.5708,
+            "joint5": 0.0,
+            "PrismaticJoint": 0.015,
+            "PrismaticJoint_finger1_b": 0.015,
+        },
+    ),
+    actuators={
+        "arm": ImplicitActuatorCfg(
+            joint_names_expr=["joint[0-5]"],
+            velocity_limit=3.0,
+            effort_limit=200.0,
+            stiffness=100.0,
+            damping=200.0,
+        ),
+        "gripper": ImplicitActuatorCfg(
+            joint_names_expr=["PrismaticJoint", "PrismaticJoint_finger1_b"],
+            velocity_limit=0.2,
+            effort_limit=200.0,
+            stiffness=8000.0,
+            damping=200.0,
+        ),
+    },
+    soft_joint_pos_limit_factor=1.0,
+)
