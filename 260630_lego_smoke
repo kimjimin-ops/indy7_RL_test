@@ -1,0 +1,83 @@
+"""
+BrickSim ↔ Isaac Lab 통합 스파이크.
+목적: import_lego / 솔버 자동 step / get_assembled_connections 가
+      Isaac Lab ManagerBasedRLEnv 안에서 동작하는지 검증. 학습 없음.
+"""
+import torch
+from isaaclab.sim.utils import use_stage
+from isaaclab.envs import ManagerBasedRLEnv
+from bricksim.core import (
+    import_lego, arrange_parts_in_workspace,
+    AssemblyThresholds, set_assembly_thresholds, set_sync_to_usd,
+    get_assembled_connections, are_parts_connected,
+)
+
+
+SMOKE_TOPOLOGY = {
+    "schema": "bricksim/lego_topology@2",
+    "parts": [
+        {"id": 0, "type": "brick", "payload": {"L": 8, "W": 8, "H": 1, "color": [200,200,200]}},
+        {"id": 1, "type": "brick", "payload": {"L": 4, "W": 2, "H": 3, "color": [252,151,172]}},
+    ],
+    "connections": [
+        {
+            "id": 0,
+            "stud_id": 0,      # 베이스의
+            "stud_iface": 1,   # 윗면 스터드에
+            "hole_id": 1,      # 브릭의
+            "hole_iface": 0,   # 아랫면 홀을
+            "offset": [2, 3],  # 8×8 베이스 중앙 근처 격자 위치
+            "yaw": 0,
+        },
+    ],
+    "pose_hints": [
+        {"part": 0, "pos": [0.4, 0.0, 0.89], "rot": [1.0, 0.0, 0.0, 0.0]},
+    ],
+}
+
+class Indy7LegoSmokeEnv(ManagerBasedRLEnv):
+    def __init__(self, cfg, **kwargs):
+        super().__init__(cfg, **kwargs)   # 167: sim.reset(), 172: load_managers() 완료
+        import omni.usd
+        stage = omni.usd.get_context().get_stage()
+
+        # 임계값
+        th = AssemblyThresholds()
+        th.enabled = True
+        th.distance_tolerance = 0.001
+        th.max_penetration = 0.005
+        th.z_angle_tolerance = 5.0 * 3.14159/180.0
+        th.required_force = 1.0
+        th.yaw_tolerance = 5.0 * 3.14159/180.0
+        th.position_tolerance = 0.002
+        set_assembly_thresholds(th)
+        set_sync_to_usd(True)
+
+        # 1) brick prim 생성 (이 시점에서 PhysX view 무효화됨)
+        self._parts = {}
+        for i in range(self.num_envs):
+            parts, _ = import_lego(json=SMOKE_TOPOLOGY, env_id=i,)
+            self._parts[i] = parts
+        print("[smoke] parts:", self._parts)
+
+        # 2) ★ view 재생성 — 깨진 PhysX view를 새 stage 구성으로 다시 잡음
+        with use_stage(self.sim.get_initial_stage()):
+            self.sim.reset()
+        self.scene.update(dt=self.physics_dt)
+
+    def step(self, action):
+        out = super().step(action)
+        assembled = get_assembled_connections(clear=True)
+        if assembled:
+            for c in assembled:
+                print(f"[smoke] CONNECTED env={c.env_id} "
+                      f"stud={c.stud_path} hole={c.hole_path} "
+                      f"offset={c.offset} yaw={c.yaw}")
+        # 결합이 토폴로지대로 됐는지 직접 조회로도 교차 확인 (첫 호출 1회만)
+        if not hasattr(self, "_checked"):
+            self._checked = True
+            for i in range(self.num_envs):
+                a = self._parts[i][0]   # 베이스
+                b = self._parts[i][1]   # 브릭
+                print(f"[smoke] are_parts_connected env={i}: {are_parts_connected(a, b)}")
+        return out
