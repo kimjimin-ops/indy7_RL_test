@@ -1,0 +1,37 @@
+#usda 1.0
+(
+    defaultPrim = "indy7"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+# ============================================================
+# 순수 로봇 USD: indy7 로봇 + separator 엔드툴(260701)만 포함.
+# indy7_lego.usda에서 아래를 의도적으로 제거함:
+#   - PhysicsScene / physicsScene  (Isaac Lab이 자체 생성 → 이중 셋업 에러 원인)
+#   - workspace_v2, Cube           (씬 요소, 로봇 에셋에 불필요)
+#   - managed scope                (BrickSim 런타임이 관리, 에셋에 박제 금지)
+#   - OmniGraph / ActionGraph / ROS2 노드
+#   - SphereLight / Render / RenderSettings
+#   - link들의 physics:velocity/angularVelocity 및 시뮬 상태 스냅샷
+#     (날아간 link6 pose 등 → 초기화 방해)
+#
+# ★ 경로 주의: 아래 두 asset 경로는 이 파일이 놓이는 위치 기준 상대경로다.
+#   이 파일을 indy7_lego.usda 와 "같은 폴더"에 두면 그대로 동작한다.
+#   다른 폴더에 둘 경우 두 경로를 실제 위치에 맞게 수정할 것.
+# ============================================================
+
+def Xform "indy7" (
+    prepend references = @./indy7_simplified.usd@
+)
+{
+    double3 xformOp:translate = (0, 0, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+
+    # link6 에 separator 엔드툴 부착 (형상/콜라이더만; 상태 스냅샷은 넣지 않음)
+    over "link6" (
+        payload = @./260701_lego_endtool.usda@
+    )
+    {
+    }
+}
