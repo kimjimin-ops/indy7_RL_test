@@ -1,0 +1,164 @@
+"""
+BrickSim ↔ Isaac Lab 통합 스파이크 — 옵션 1 검증 (생성 + 결합).
+목적: allocate_unmanaged_brick_part(엔드툴 브릭) + create_connection(그립)이
+      Isaac Lab CPU 파이프라인에서 동작하는지. 들어올리기/분해는 다음 단계.
+"""
+from pxr import UsdGeom, Gf, UsdPhysics
+import omni.usd
+from isaaclab.sim.utils import use_stage
+from isaaclab.envs import ManagerBasedRLEnv
+from bricksim.core import (
+    import_lego,
+    allocate_unmanaged_brick_part,
+    create_connection,
+    are_parts_connected,
+    compute_connected_component,
+    AssemblyThresholds, set_assembly_thresholds,
+    BreakageThresholds, set_breakage_thresholds,
+    set_sync_to_usd,
+)
+
+# 베이스(0) 위에 held 브릭(1)이 결합된 구조 = "plate A 위의 브릭" (CPU에서 검증됨)
+STRUCT = {
+    "schema": "bricksim/lego_topology@2",
+    "parts": [
+        {"id": 0, "type": "brick", "payload": {"L": 8, "W": 8, "H": 1, "color": [200, 200, 200]}},
+        {"id": 1, "type": "brick", "payload": {"L": 4, "W": 2, "H": 3, "color": [252, 151, 172]}},
+    ],
+    "connections": [
+        {"id": 0, "stud_id": 0, "stud_iface": 1, "hole_id": 1, "hole_iface": 0,
+         "offset": [2, 3], "yaw": 0},
+    ],
+    "pose_hints": [
+        {"part": 0, "pos": [0.4, 0.0, 0.89], "rot": [1.0, 0.0, 0.0, 0.0]},
+    ],
+}
+
+STUD_IF = 1   # 브릭 윗면 스터드
+HOLE_IF = 0   # 브릭 아랫면 홀
+ENDTOOL_PATH = "/World/envs/env_0/Robot/link6/EndtoolBrick"
+ENDTOOL_LOCAL_Z = 0.175   # link6 로컬 기준 엔드툴 브릭 z 오프셋 (육안 조정값)
+
+
+def _set_pose(prim, pos, quat_wxyz=(1.0, 0.0, 0.0, 0.0)):
+    """translate + orient 를 함께 세팅. op의 실제 precision(float/double)에 맞춰
+    Vec3f/Vec3d, Quatf/Quatd 를 골라 넣는다 (unitsResolve 등 기존 op 보존)."""
+    xf = UsdGeom.Xformable(prim)
+    t_op = o_op = None
+    for op in xf.GetOrderedXformOps():
+        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+            t_op = op
+        elif op.GetOpType() == UsdGeom.XformOp.TypeOrient:
+            o_op = op
+    if t_op is None:
+        t_op = xf.AddTranslateOp()
+    if o_op is None:
+        # 새로 만들 때도 BrickSim 관례에 맞춰 float 정밀도로
+        o_op = xf.AddOrientOp(precision=UsdGeom.XformOp.PrecisionFloat)
+
+    # translate
+    if t_op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble:
+        t_op.Set(Gf.Vec3d(*pos))
+    else:
+        t_op.Set(Gf.Vec3f(*pos))
+
+    # orient (BrickSim가 만든 op는 GfQuatf 인 경우가 많음)
+    if o_op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble:
+        o_op.Set(Gf.Quatd(*quat_wxyz))
+    else:
+        o_op.Set(Gf.Quatf(*quat_wxyz))
+
+
+class Indy7LegoSmokeEnv(ManagerBasedRLEnv):
+    def __init__(self, cfg, **kwargs):
+        super().__init__(cfg, **kwargs)
+        stage = omni.usd.get_context().get_stage()
+        self._stage = stage   # step에서 재사용
+
+        # 임계값
+        ath = AssemblyThresholds()
+        ath.enabled = True
+        ath.distance_tolerance = 0.001
+        ath.max_penetration = 0.005
+        ath.z_angle_tolerance = 5.0 * 3.14159 / 180.0
+        ath.required_force = 1.0
+        ath.yaw_tolerance = 5.0 * 3.14159 / 180.0
+        ath.position_tolerance = 0.002
+        set_assembly_thresholds(ath)
+
+        bth = BreakageThresholds()
+        bth.enabled = True          # 분해 물리 켜둠 (다음 단계 대비)
+        set_breakage_thresholds(bth)
+
+        set_sync_to_usd(True)
+
+        # ===== 모든 authoring을 batch (view는 마지막에 한 번만 재생성) =====
+        # 1) plate A + held 브릭 (검증된 import_lego)
+        parts, conns = import_lego(json=STRUCT, env_id=0)
+        self._base0 = parts[0]
+        self._held1 = parts[1]
+        print(f"[smoke] import parts={parts} conns={conns}")
+
+        # 2) 엔드툴 브릭 생성 (★ 미지수 A: unmanaged가 커스텀 경로에서 되는가)
+        try:
+            allocate_unmanaged_brick_part(
+                dimensions=(4, 2, 3), color=(255, 255, 255), path=ENDTOOL_PATH,
+            )
+            exists = stage.GetPrimAtPath(ENDTOOL_PATH).IsValid()
+            print(f"[smoke] allocate_unmanaged OK, prim valid={exists}")
+        except Exception as e:
+            print(f"[smoke] allocate_unmanaged FAILED: {e!r}")
+            exists = False
+
+        # 엔드툴(link6) 로컬 기준에 브릭 고정 (스터드 아래 / 홀 위 = X축 180°)
+        if exists:
+            brick_prim = stage.GetPrimAtPath(ENDTOOL_PATH)
+            _set_pose(brick_prim, (0.0, 0.0, ENDTOOL_LOCAL_Z),
+                      quat_wxyz=(0.0, 1.0, 0.0, 0.0))   # 스터드 아래 / 홀 위
+            # kinematic: 중력/물리에 밀리지 않고 부모(link6)를 정확히 따라가게 고정
+            rb = UsdPhysics.RigidBodyAPI(brick_prim)
+            if rb:
+                rb.CreateKinematicEnabledAttr(True)
+            print(f"[smoke] endtool brick placed at link6-local (0, 0, {ENDTOOL_LOCAL_Z}), kinematic=on")
+
+        # 3) 그립 결합 — ★ 비활성화 ★
+        # 원인: create_connection(held1↔endtool)을 초기화 때 원격으로 만들면,
+        #       BrickSim이 hole 파트(엔드툴 브릭)를 held1 위 결합 자세로 순간이동시켜
+        #       link6 로컬 오프셋이 (0.4, 0.19, -1.25)처럼 엉뚱하게 고정됨.
+        # 그립 결합은 로봇이 실제로 held1에 접근한 뒤(다음 단계) 생성한다.
+        self._grip_conn = None
+
+        # ===== view 한 번만 재생성 =====
+        with use_stage(self.sim.get_initial_stage()):
+            self.sim.reset()
+        self.scene.update(dt=self.physics_dt)
+
+        self._checked = False
+
+    def step(self, action):
+        out = super().step(action)
+        if not self._checked:
+            self._checked = True
+
+            # 결합 상태 교차 확인
+            plate = are_parts_connected(self._base0, self._held1)   # plate A 결합
+            grip = are_parts_connected(self._held1, ENDTOOL_PATH)   # 엔드툴 그립
+            print(f"[smoke] connected? plate(base0-held1)={plate} "
+                  f"grip(held1-endtool)={grip}")
+
+            # 엔드툴에 연결된 전체 덩어리 (base0, held1까지 잡히면 3개 사슬 성립)
+            try:
+                comp_parts, comp_conns = compute_connected_component(ENDTOOL_PATH)
+                print(f"[smoke] component of endtool: parts={comp_parts}")
+            except Exception as e:
+                print(f"[smoke] connected_component FAILED: {e!r}")
+
+            # 엔드툴 브릭이 link6에서 실제로 얼마나 떨어져 있는지 (진단)
+            cache = UsdGeom.XformCache()
+            link6 = self._stage.GetPrimAtPath("/World/envs/env_0/Robot/link6")
+            brick = self._stage.GetPrimAtPath(ENDTOOL_PATH)
+            rel = cache.GetLocalToWorldTransform(brick) * \
+                cache.GetLocalToWorldTransform(link6).GetInverse()
+            print(f"[smoke] brick relative to link6: {rel.ExtractTranslation()}")
+
+        return out
