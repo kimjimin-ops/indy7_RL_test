@@ -1,0 +1,70 @@
+"""엔드툴 브릭 자세/높이 육안 튜닝 (standalone GUI).
+실행: cd ~/test3 && python source/test3/test3/tasks/reach/endtool_pose_tuner.py
+뷰포트에서 EndtoolBrick 선택 → W(이동)/E(회전) gizmo → Property > Transform 값 읽기.
+"""
+from isaaclab.app import AppLauncher
+
+app_launcher = AppLauncher(headless=False)
+simulation_app = app_launcher.app
+
+# ---- 앱 시작 후에 import ----
+import omni.usd
+from pxr import UsdGeom, Gf, UsdLux, Sdf
+from isaacsim.core.utils.stage import add_reference_to_stage
+from isaacsim.core.utils.viewports import set_camera_view
+from bricksim.core import allocate_unmanaged_brick_part
+from test3.assets import INDY7_CFG
+
+ROBOT_PATH = "/World/Robot"
+ENDTOOL_PATH = f"{ROBOT_PATH}/link6/EndtoolBrick"
+ENDTOOL_LOCAL_Z = 0.17
+INIT_QUAT_WXYZ = (0.0, 1.0, 0.0, 0.0)   # 스터드 아래 / 홀 위 (X축 180°)
+
+
+def set_pose(prim, pos, quat_wxyz):
+    xf = UsdGeom.Xformable(prim)
+    t_op = o_op = None
+    for op in xf.GetOrderedXformOps():
+        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+            t_op = op
+        elif op.GetOpType() == UsdGeom.XformOp.TypeOrient:
+            o_op = op
+    if t_op is None:
+        t_op = xf.AddTranslateOp()
+    if o_op is None:
+        o_op = xf.AddOrientOp(precision=UsdGeom.XformOp.PrecisionFloat)
+    if t_op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble:
+        t_op.Set(Gf.Vec3d(*pos))
+    else:
+        t_op.Set(Gf.Vec3f(*pos))
+    if o_op.GetPrecision() == UsdGeom.XformOp.PrecisionDouble:
+        o_op.Set(Gf.Quatd(*quat_wxyz))
+    else:
+        o_op.Set(Gf.Quatf(*quat_wxyz))
+
+
+stage = omni.usd.get_context().get_stage()
+
+# 조명 (없으면 새까맣게 나옴)
+dome = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/DomeLight"))
+dome.CreateIntensityAttr(1000.0)
+
+# 로봇
+add_reference_to_stage(usd_path=INDY7_CFG.spawn.usd_path, prim_path=ROBOT_PATH)
+
+# 엔드툴 브릭
+allocate_unmanaged_brick_part(dimensions=(4, 2, 3), color=(255, 255, 255),
+                              path=ENDTOOL_PATH)
+brick = stage.GetPrimAtPath(ENDTOOL_PATH)
+set_pose(brick, (0.0, 0.0, ENDTOOL_LOCAL_Z), INIT_QUAT_WXYZ)
+
+# 카메라를 로봇 쪽으로
+set_camera_view(eye=[1.2, 1.2, 1.0], target=[0.0, 0.0, 0.3])
+
+print(f"[tuner] EndtoolBrick 생성됨: {ENDTOOL_PATH}")
+print(f"[tuner] 뷰포트에서 Robot 선택 후 F 키로 프레이밍. EndtoolBrick 선택해 W/E gizmo 조정.")
+
+while simulation_app.is_running():
+    simulation_app.update()
+
+simulation_app.close()
