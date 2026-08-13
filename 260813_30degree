@@ -1,0 +1,120 @@
+import numpy as np
+import serial
+import time
+import matplotlib.pyplot as plt
+
+# -----------------------------
+# Arduino 연결
+# -----------------------------
+arduino = serial.Serial('COM6', 9600, timeout=2)
+time.sleep(2)
+
+arduino.reset_input_buffer()
+
+# -----------------------------
+# Agent 정의
+# -----------------------------
+class Agent:
+
+    def __init__(self, epsilon, actions):
+
+        self.epsilon = epsilon
+        self.actions = actions
+
+        # optimistic initialization
+        self.Qs = np.random.rand(len(actions))
+        self.ns = np.zeros(len(actions))
+
+    def update(self, action, reward):
+
+        self.ns[action] += 1
+        self.Qs[action] += (reward - self.Qs[action]) / self.ns[action]
+
+    def get_action(self):
+
+        if np.random.rand() < self.epsilon:
+            return np.random.randint(len(self.actions))
+
+        return np.argmax(self.Qs)
+
+
+# -----------------------------
+# 각도 공간
+# -----------------------------
+angles = np.arange(-20, 51,1)
+
+agent = Agent(epsilon=0.1, actions=angles)
+
+steps = 50
+
+reward_history = []
+angle_history = []
+
+
+# -----------------------------
+# Arduino 완료 대기 함수
+# -----------------------------
+def wait_for_done():
+
+    while True:
+
+        line = arduino.readline().decode().strip()
+
+        if line == "done":
+            break
+
+
+# -----------------------------
+# 학습 루프
+# -----------------------------
+for step in range(steps):
+
+    action = agent.get_action()
+    angle = angles[action]
+
+    # Arduino로 각도 전송
+    arduino.write(f"{angle}\n".encode())
+
+    # Arduino 동작 완료 대기
+    wait_for_done()
+
+    # reward 계산
+    reward = 1 - abs(angle - 30) / 70
+
+    agent.update(action, reward)
+
+    reward_history.append(reward)
+    angle_history.append(angle)
+
+    print(f"step {step:3d} | angle {angle:3d} | reward {reward:.3f}", flush=True)
+
+
+# -----------------------------
+# 결과
+# -----------------------------
+best_angle = angles[np.argmax(agent.Qs)]
+
+print("\nBest angle:", best_angle)
+
+# -----------------------------
+# 그래프
+# -----------------------------
+plt.figure()
+
+plt.subplot(2,1,1)
+plt.plot(angle_history)
+plt.ylabel("Angle")
+plt.xlabel("Step")
+
+plt.subplot(2,1,2)
+plt.plot(reward_history)
+plt.ylabel("Reward")
+plt.xlabel("Step")
+
+plt.tight_layout()
+plt.show()
+
+# -----------------------------
+# Serial 종료
+# -----------------------------
+arduino.close()
