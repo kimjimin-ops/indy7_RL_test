@@ -1,0 +1,30 @@
+#include <Servo.h>
+
+Servo servo1;
+
+void setup() {
+
+  Serial.begin(9600);
+  servo1.attach(8);
+
+}
+
+void loop() {
+
+  if (Serial.available()) {
+
+    String data = Serial.readStringUntil('\n');
+
+    int angle = data.toInt();
+
+    int servo_angle = angle + 90;
+
+    servo1.write(servo_angle);
+
+    delay(1500);   // 서보 이동 시간
+
+    Serial.println("done");   // Python에게 완료 신호
+
+  }
+
+}
